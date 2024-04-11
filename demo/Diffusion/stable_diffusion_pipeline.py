@@ -56,7 +56,7 @@ from utilities import (
     TRT_LOGGER,
     Engine,
     filter_func,
-    get_smoothquant_config,
+    get_quant_config,
     get_refit_weights,
     load_calib_prompts,
     merge_loras,
@@ -314,6 +314,7 @@ class StableDiffusionPipeline:
         enable_all_tactics=False,
         timing_cache=None,
         int8=False,
+        fp8=False,
         quantization_level=2.5,
         quantization_percentile=0.4,
         quantization_alpha=0.6,
@@ -407,11 +408,12 @@ class StableDiffusionPipeline:
         # Torch fallback for VAE if specified
         torch_fallback = dict(zip(model_names, [self.torch_inference for model_name in model_names]))
         model_suffix = dict(zip(model_names, [lora_suffix if do_lora_merge[model_name] else '' for model_name in model_names]))
-        use_int8 = dict.fromkeys(model_names, False)
-        if int8:
+        use_quant = dict.fromkeys(model_names, False)
+        if int8 or fp8:
             assert self.pipeline_type.is_sd_xl(), "int8 quantization only supported for SDXL pipeline"
-            use_int8['unetxl'] = True
-            model_suffix['unetxl'] += f"-int8.l{quantization_level}.bs2.s{denoising_steps}.c{calibration_steps}.p{quantization_percentile}.a{quantization_alpha}"
+            use_quant['unetxl'] = True
+            quant_str = "int8" if int8 else "fp8"
+            model_suffix['unetxl'] += f"-{quant_str}.l{quantization_level}.bs2.s{denoising_steps}.c{calibration_steps}.p{quantization_percentile}.a{quantization_alpha}"
         onnx_path = dict(zip(model_names, [self.getOnnxPath(model_name, onnx_dir, opt=False, suffix=model_suffix[model_name]) for model_name in model_names]))
         onnx_opt_path = dict(zip(model_names, [self.getOnnxPath(model_name, onnx_dir, suffix=model_suffix[model_name]) for model_name in model_names]))
         engine_path = dict(zip(model_names, [self.getEnginePath(model_name, engine_dir, do_engine_refit[model_name], suffix=model_suffix[model_name]) for model_name in model_names]))
@@ -425,7 +427,7 @@ class StableDiffusionPipeline:
             do_export_weights_map = weights_map_path[model_name] and not os.path.exists(weights_map_path[model_name])
             if do_export_onnx or do_export_weights_map:
                 # Non-quantized ONNX export
-                if not use_int8[model_name]:
+                if not use_quant[model_name]:
                     obj.export_onnx(onnx_path[model_name], onnx_opt_path[model_name], onnx_opset, opt_image_height, opt_image_width, enable_lora_merge=do_lora_merge[model_name], static_shape=static_shape)
                 else:
                     state_dict_path = self.getStateDictPath(model_name, onnx_dir, suffix=model_suffix[model_name])
@@ -438,7 +440,7 @@ class StableDiffusionPipeline:
                         # Use batch_size = 2 for UNet calibration
                         calibration_prompts = load_calib_prompts(2, calibration_file)
                         # TODO check size > calibration_steps
-                        quant_config = get_smoothquant_config(model, quantization_level)
+                        quant_config = get_quant_config(model, quantization_level, int8, fp8)
                         if quantization_percentile is not None:
                             quant_config["percentile"] = quantization_percentile
                             quant_config["base-step"] = int(denoising_steps)
@@ -471,7 +473,7 @@ class StableDiffusionPipeline:
                                 n_steps=denoising_steps,
                             )
 
-                        print(f"[I] Performing int8 calibration for {calibration_steps} steps. This can take a long time.")
+                        print(f"[I] Performing {quant_str} calibration for {calibration_steps} steps. This can take a long time.")
                         calibration.calibrate(model, quant_config["algorithm"], forward_loop=calibration_loop)
                         torch.save(model.state_dict(), state_dict_path)
 
@@ -480,7 +482,8 @@ class StableDiffusionPipeline:
                         model = obj.get_model()
                         replace_lora_layers(model)
                         atq.replace_quant_module(model)
-                        quant_config = atq.INT8_DEFAULT_CFG
+                        # quant_config = atq.INT8_DEFAULT_CFG
+                        quant_config = atq.INT8_DEFAULT_CFG if int8 else atq.FP8_DEFAULT_CFG
                         atq.set_quantizer_by_cfg(model, quant_config["quant_cfg"])
                         model.load_state_dict(torch.load(state_dict_path), strict=True)
                         quantize_lvl(model, quantization_level)
@@ -503,10 +506,14 @@ class StableDiffusionPipeline:
             if not os.path.exists(engine_path[model_name]):
                 update_output_names = obj.get_output_names() + obj.extra_output_names if obj.extra_output_names else None
                 extra_build_args = {'verbose': self.verbose}
-                if use_int8[model_name]:
-                    extra_build_args['int8'] = True
+                if use_quant[model_name]:
+                    if int8:
+                        extra_build_args['int8'] = True
+                    else:
+                        extra_build_args['fp8'] = True
                     extra_build_args['precision_constraints'] = 'prefer'
                     extra_build_args['builder_optimization_level'] = 4
+                print(f"extra build args: {json.dumps(extra_build_args, indent=2)}")
                 fp16amp = obj.fp16
                 engine.build(onnx_opt_path[model_name],
                     fp16=fp16amp,

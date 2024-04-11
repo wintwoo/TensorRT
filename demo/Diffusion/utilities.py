@@ -234,6 +234,7 @@ class Engine():
         fp16=True,
         tf32=False,
         int8=False,
+        fp8=False,
         input_profile=None,
         enable_refit=False,
         enable_all_tactics=False,
@@ -262,6 +263,7 @@ class Engine():
                 config=CreateConfig(fp16=fp16,
                     tf32=tf32,
                     int8=int8,
+                    fp8=fp8,
                     refittable=enable_refit,
                     profiles=[p],
                     load_timing_cache=timing_cache,
@@ -434,11 +436,14 @@ def quantize_lvl(unet, quant_level=2.5):
                 module.input_quantizer.disable()
                 module.weight_quantizer.disable()
 
-def get_smoothquant_config(model, quant_level=3):
+def get_quant_config(model, quant_level=3, int8=True, fp8=False):
+    if not int8 ^ fp8:
+        raise RuntimeError("Specify one of int8 or fp8, but not both.")
     quant_config = {
         "quant_cfg": {},
-        "algorithm": "smoothquant",
+        # "algorithm": "smoothquant",
     }
+    quant_config["algorithm"] = "smoothquant" if int8 else "max"
     for name, module in model.named_modules():
         w_name = f"{name}*weight_quantizer"
         i_name = f"{name}*input_quantizer"
@@ -456,11 +461,22 @@ def get_smoothquant_config(model, quant_level=3):
                 or (quant_level >= 2.5 and ("to_q" in name or "to_k" in name or "to_v" in name))
                 or quant_level == 3
             ):
-                quant_config["quant_cfg"][w_name] = {"num_bits": 8, "axis": 0}  # type: ignore
-                quant_config["quant_cfg"][i_name] = {"num_bits": 8, "axis": -1}  # type: ignore
+                if int8:
+                    quant_config["quant_cfg"][w_name] = {"num_bits": 8, "axis": 0}  # type: ignore
+                    quant_config["quant_cfg"][i_name] = {"num_bits": 8, "axis": -1}  # type: ignore
+                elif fp8:
+                    quant_config["quant_cfg"][w_name] = {"num_bits": (4, 3), "axis": 0}  # type: ignore
+                    quant_config["quant_cfg"][i_name] = {"num_bits": (4, 3), "axis": -1}  # type: ignore
         elif isinstance(module, torch.nn.Conv2d):
-            quant_config["quant_cfg"][w_name] = {"num_bits": 8, "axis": 0}  # type: ignore
-            quant_config["quant_cfg"][i_name] = {"num_bits": 8, "axis": None}  # type: ignore
+            if int8:
+                quant_config["quant_cfg"][w_name] = {"num_bits": 8, "axis": 0}  # type: ignore
+                quant_config["quant_cfg"][i_name] = {"num_bits": 8, "axis": None}  # type: ignore
+            elif fp8:
+                quant_config["quant_cfg"][w_name] = {"num_bits": (4, 3), "axis": 0}  # type: ignore
+                quant_config["quant_cfg"][i_name] = {"num_bits": (4, 3), "axis": None}  # type: ignore
+
+    import json
+    print(f"quant_config is {json.dumps(quant_config, indent=2)}")
     return quant_config
 
 class PercentileAmaxes:
@@ -503,6 +519,7 @@ def add_arguments(parser):
     # TensorRT engine build
     parser.add_argument('--engine-dir', default='engine', help="Output directory for TensorRT engines")
     parser.add_argument('--int8', action='store_true', help="Apply int8 quantization.")
+    parser.add_argument('--fp8', action='store_true', help="Apply fp8 quantization.")
     parser.add_argument('--quantization-level', type=float, default=3.0, choices=range(1,4), help="int8/fp8 quantization level, 1: CNN, 2: CNN+FFN, 2.5: CNN+FFN+QKV, 3: CNN+FC")
     parser.add_argument('--build-static-batch', action='store_true', help="Build TensorRT engines with fixed batch size.")
     parser.add_argument('--build-dynamic-shape', action='store_true', help="Build TensorRT engines with dynamic image shapes.")
@@ -568,6 +585,7 @@ def process_pipeline_args(args):
         'enable_refit': args.build_enable_refit,
         'timing_cache': args.timing_cache,
         'int8': args.int8,
+        'fp8': args.fp8,
         'quantization_level': args.quantization_level,
         'denoising_steps': args.denoising_steps,
     }
